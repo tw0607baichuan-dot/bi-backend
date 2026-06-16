@@ -1,0 +1,15 @@
+[Unit]
+Description=BI Dashboard Backend (Flask + Gunicorn)
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/bi-backend
+ExecStart=/opt/bi-backend/venv/bin/gunicorn -w 2 -b 127.0.0.1:5000 --access-logfile /var/log/bi-backend/access.log --error-logfile /var/log/bi-backend/error.log app:app
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
