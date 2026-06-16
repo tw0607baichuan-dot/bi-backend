@@ -18,6 +18,7 @@ import sqlite3
 from flask import Flask, jsonify, request
 
 import excel_parser
+import refund_queries
 
 app = Flask(__name__)
 
@@ -49,7 +50,7 @@ def _safe_component(s):
 def health():
     return jsonify({
         "status": "ok",
-        "version": "phase-2.2",
+        "version": "phase-2.3",
         "timestamp": datetime.datetime.now().isoformat(),
     })
 
@@ -227,6 +228,99 @@ def list_refunds():
     finally:
         conn.close()
     return jsonify([dict(r) for r in rows])
+
+
+def _has_active_data(conn):
+    """有 active upload 且 refunds 非空才算有资料。"""
+    active = conn.execute(
+        "SELECT COUNT(*) AS c FROM uploads WHERE status = 'active'"
+    ).fetchone()["c"]
+    if active == 0:
+        return False
+    refunds = conn.execute("SELECT COUNT(*) AS c FROM refunds").fetchone()["c"]
+    return refunds > 0
+
+
+@app.route("/api/refunds/data")
+def refunds_data():
+    range_key = request.args.get("range", "week")
+    start_date = request.args.get("start_date")
+    end_date = request.args.get("end_date")
+    compare_key = request.args.get("compare", "none")
+
+    # 时间范围解析(参数错 → 400)
+    try:
+        start_iso, end_iso, range_label = refund_queries.resolve_time_range(
+            range_key, start_date, end_date
+        )
+        compare_range = refund_queries.resolve_compare_range(
+            compare_key, start_iso, end_iso
+        )
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+
+    range_block = {"label": range_label, "start": start_iso, "end": end_iso}
+
+    conn = get_conn()
+    try:
+        # DB 空 → 200 + 空结构(让前端显示「请上传 Excel」)
+        if not _has_active_data(conn):
+            return jsonify({
+                "status": "ok",
+                "has_data": False,
+                "range": range_block,
+                "current": refund_queries.empty_period(),
+                "compare": None,
+                "insights": [],
+            })
+
+        current = refund_queries.build_period(conn, start_iso, end_iso)
+
+        compare = None
+        if compare_range is not None:
+            c_start, c_end, c_label = compare_range
+            compare = refund_queries.build_period(conn, c_start, c_end)
+            compare["label"] = c_label
+            compare["start"] = c_start
+            compare["end"] = c_end
+
+        insights = refund_queries.compute_insights(current, compare)
+    finally:
+        conn.close()
+
+    return jsonify({
+        "status": "ok",
+        "has_data": True,
+        "range": range_block,
+        "current": current,
+        "compare": compare,
+        "insights": insights,
+    })
+
+
+@app.route("/api/refunds/health-data")
+def refunds_health_data():
+    """前端预热用:回报 DB 是否有资料 + 资料涵盖区间。"""
+    conn = get_conn()
+    try:
+        has_data = _has_active_data(conn)
+        total = conn.execute("SELECT COUNT(*) AS c FROM refunds").fetchone()["c"]
+        active = conn.execute(
+            "SELECT COUNT(*) AS c FROM uploads WHERE status = 'active'"
+        ).fetchone()["c"]
+        span = conn.execute(
+            "SELECT MIN(date_iso) AS mn, MAX(date_iso) AS mx FROM refunds"
+        ).fetchone()
+    finally:
+        conn.close()
+    return jsonify({
+        "status": "ok",
+        "has_data": has_data,
+        "total_refunds": total,
+        "active_uploads": active,
+        "earliest": span["mn"],
+        "latest": span["mx"],
+    })
 
 
 if __name__ == "__main__":
