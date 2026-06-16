@@ -2,3 +2,10 @@ venv/
 __pycache__/
 *.pyc
 *.backup
+
+# database files — never track; prod DB lives at /var/data/refunds/db.sqlite
+db.sqlite
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
