@@ -19,6 +19,12 @@ import re
 import pandas as pd
 
 
+# 架构修正:退费档全公司一份,不分产品线。
+# uploads.product_line 字段语义改为「公司」,目前只有一家「悦达」。
+# 档名仍需含此公司名才视为合法(单一公司白名单,防误传无关档案)。
+COMPANY = "悦达"
+
+
 # ---------- 例外 ----------
 class ExcelParseError(Exception):
     pass
@@ -56,22 +62,28 @@ _EXCEL_EPOCH = datetime.datetime(1899, 12, 30)
 def parse_filename(filename, default_year=None):
     """
     "5_17_5_23悦达.xlsx" -> {product_line, week_start, week_end}
+    档名只解析日期段;product_line(语义=公司)固定回传 COMPANY「悦达」。
+    档名尾段须含公司名才合法(任何后缀皆可:「悦达 (2)」「悦达投诉订单」「悦达_备份」…)。
     年份从 default_year 带入(由内容第一笔日期推断);若 None 则用今年。
     """
     base = os.path.basename(filename)
     stem = re.sub(r"\.(xlsx|xls)$", "", base, flags=re.IGNORECASE)
 
-    # M_D_M_D + 产品线名
-    m = re.match(r"^\s*(\d{1,2})_(\d{1,2})_(\d{1,2})_(\d{1,2})\s*(.+?)\s*$", stem)
+    # M_D <sep> M_D + 名称段;两段日期之间允许 _ - ~ ～ 任一分隔(百川实际档名用 ~)
+    m = re.match(r"^\s*(\d{1,2})_(\d{1,2})[_\-~～](\d{1,2})_(\d{1,2})\s*(.+?)\s*$", stem)
     if not m:
         raise FilenameParseError(
-            f"档名格式不符,预期 'M_D_M_D产品线.xlsx',收到:{base!r}"
+            f"档名格式不符,预期 'M_D_M_D{COMPANY}.xlsx',收到:{base!r}"
         )
 
-    m1, d1, m2, d2, product_line = m.groups()
-    product_line = product_line.strip()
-    if not product_line:
-        raise FilenameParseError(f"档名缺产品线:{base!r}")
+    m1, d1, m2, d2, name_part = m.groups()
+    name_part = name_part.strip()
+    # 名称段须含公司名(单一公司白名单);后缀一律忽略,product_line 固定 = COMPANY
+    if COMPANY not in name_part:
+        raise FilenameParseError(
+            f"档名未含公司名「{COMPANY}」,拒收:{base!r}"
+        )
+    product_line = COMPANY
 
     if default_year is None:
         default_year = datetime.date.today().year

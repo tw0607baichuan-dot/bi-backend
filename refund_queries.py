@@ -32,16 +32,26 @@ def _quarter_start(d):
     return datetime.date(d.year, q_month, 1)
 
 
+def _week_start(d):
+    """该日期所在周的周一。"""
+    return d - datetime.timedelta(days=d.weekday())
+
+
 # ---------- 时间范围解析 ----------
 def resolve_time_range(range_key, start=None, end=None, today=None):
-    """range_key: week|month|quarter|year|ytd|custom -> (start_iso, end_iso, label)"""
+    """range_key: week|last-week|month|quarter|year|ytd|custom -> (start_iso, end_iso, label)"""
     today = today or datetime.date.today()
     range_key = (range_key or "week").lower()
 
     if range_key == "week":
-        s = today - datetime.timedelta(days=today.weekday())  # 本周一
+        s = _week_start(today)                                 # 本周一
         e = s + datetime.timedelta(days=6)                     # 本周日
         label = f"本周 ({_md(s)}-{_md(e)})"
+    elif range_key == "last-week":
+        # 上一个完整周(周一~周日);例:today=6/16 → 6/8~6/14
+        s = _week_start(today) - datetime.timedelta(days=7)    # 上周一
+        e = s + datetime.timedelta(days=6)                     # 上周日
+        label = f"上周 ({_md(s)}-{_md(e)})"
     elif range_key == "month":
         s = today.replace(day=1)
         e = today
@@ -111,11 +121,16 @@ def _shift_year(d, delta):
         return d.replace(year=d.year + delta, day=28)  # 2/29 → 2/28
 
 
+# 只统计 active upload 的退费;被 supersede 的旧版本明细排除在所有 KPI 查询之外
+# (supersede 只改 uploads.status、不删 refunds 明细,故查询层须自行过滤)
+_ACTIVE_FILTER = "AND upload_id IN (SELECT id FROM uploads WHERE status = 'active')"
+
+
 # ---------- 各区块查询 ----------
 def get_kpi(conn, start_iso, end_iso):
     row = conn.execute(
         "SELECT COUNT(*) AS orders, COALESCE(SUM(amount),0) AS total "
-        "FROM refunds WHERE date_iso BETWEEN ? AND ?",
+        f"FROM refunds WHERE date_iso BETWEEN ? AND ? {_ACTIVE_FILTER}",
         (start_iso, end_iso),
     ).fetchone()
     orders = row["orders"]
@@ -133,7 +148,7 @@ def get_kpi(conn, start_iso, end_iso):
 def get_trend(conn, start_iso, end_iso):
     rows = conn.execute(
         "SELECT date_iso, COUNT(*) AS orders, COALESCE(SUM(amount),0) AS amount "
-        "FROM refunds WHERE date_iso BETWEEN ? AND ? GROUP BY date_iso",
+        f"FROM refunds WHERE date_iso BETWEEN ? AND ? {_ACTIVE_FILTER} GROUP BY date_iso",
         (start_iso, end_iso),
     ).fetchall()
     by_date = {r["date_iso"]: r for r in rows}
@@ -154,7 +169,7 @@ def get_trend(conn, start_iso, end_iso):
 def get_payment_breakdown(conn, start_iso, end_iso):
     rows = conn.execute(
         "SELECT payment_type AS type, COUNT(*) AS orders, COALESCE(SUM(amount),0) AS amount "
-        "FROM refunds WHERE date_iso BETWEEN ? AND ? GROUP BY payment_type ORDER BY amount DESC",
+        f"FROM refunds WHERE date_iso BETWEEN ? AND ? {_ACTIVE_FILTER} GROUP BY payment_type ORDER BY amount DESC",
         (start_iso, end_iso),
     ).fetchall()
     total_orders = sum(r["orders"] for r in rows) or 1
@@ -171,7 +186,7 @@ def get_payment_breakdown(conn, start_iso, end_iso):
 
 def get_amount_tiers(conn, start_iso, end_iso):
     rows = conn.execute(
-        "SELECT amount FROM refunds WHERE date_iso BETWEEN ? AND ?",
+        f"SELECT amount FROM refunds WHERE date_iso BETWEEN ? AND ? {_ACTIVE_FILTER}",
         (start_iso, end_iso),
     ).fetchall()
     counts = {b: 0 for b in _TIER_BOUNDS}
@@ -194,7 +209,7 @@ def get_amount_tiers(conn, start_iso, end_iso):
 def get_platform_top10(conn, start_iso, end_iso):
     rows = conn.execute(
         "SELECT platform_id, COUNT(*) AS orders, COALESCE(SUM(amount),0) AS amount "
-        "FROM refunds WHERE date_iso BETWEEN ? AND ? "
+        f"FROM refunds WHERE date_iso BETWEEN ? AND ? {_ACTIVE_FILTER} "
         "GROUP BY platform_id ORDER BY amount DESC LIMIT 10",
         (start_iso, end_iso),
     ).fetchall()

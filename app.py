@@ -237,7 +237,11 @@ def _has_active_data(conn):
     ).fetchone()["c"]
     if active == 0:
         return False
-    refunds = conn.execute("SELECT COUNT(*) AS c FROM refunds").fetchone()["c"]
+    # 只算 active upload 的 refunds(排除被 supersede 的旧版本明细)
+    refunds = conn.execute(
+        "SELECT COUNT(*) AS c FROM refunds "
+        "WHERE upload_id IN (SELECT id FROM uploads WHERE status = 'active')"
+    ).fetchone()["c"]
     return refunds > 0
 
 
@@ -304,12 +308,16 @@ def refunds_health_data():
     conn = get_conn()
     try:
         has_data = _has_active_data(conn)
-        total = conn.execute("SELECT COUNT(*) AS c FROM refunds").fetchone()["c"]
+        # total_refunds 与涵盖区间都只看 active upload 的明细(排除 superseded,与 KPI 端点一致)
+        active_subq = "WHERE upload_id IN (SELECT id FROM uploads WHERE status = 'active')"
+        total = conn.execute(
+            f"SELECT COUNT(*) AS c FROM refunds {active_subq}"
+        ).fetchone()["c"]
         active = conn.execute(
             "SELECT COUNT(*) AS c FROM uploads WHERE status = 'active'"
         ).fetchone()["c"]
         span = conn.execute(
-            "SELECT MIN(date_iso) AS mn, MAX(date_iso) AS mx FROM refunds"
+            f"SELECT MIN(date_iso) AS mn, MAX(date_iso) AS mx FROM refunds {active_subq}"
         ).fetchone()
     finally:
         conn.close()

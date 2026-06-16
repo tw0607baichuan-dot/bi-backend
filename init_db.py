@@ -44,7 +44,7 @@ CREATE TABLE IF NOT EXISTS uploads (
     file_md5 TEXT NOT NULL,            -- 用来侦测重复上传
 
     -- 业务 metadata(从档名 + 内容解析)
-    product_line TEXT NOT NULL,        -- 从档名抓出(例:悦达)
+    product_line TEXT NOT NULL,        -- 实际意义是「公司」(目前全部是「悦达」),保留字段名是历史原因
     week_start TEXT NOT NULL,          -- 该档案涵盖的起始日
     week_end TEXT NOT NULL,            -- 该档案涵盖的结束日
     rows_imported INTEGER NOT NULL,    -- 解析进 SQLite 几笔
