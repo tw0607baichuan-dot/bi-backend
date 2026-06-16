@@ -17,6 +17,7 @@ import sqlite3
 
 from flask import Flask, jsonify, request
 
+import agents_sync
 import excel_parser
 import refund_queries
 
@@ -50,7 +51,7 @@ def _safe_component(s):
 def health():
     return jsonify({
         "status": "ok",
-        "version": "phase-2.3",
+        "version": "phase-3.1",
         "timestamp": datetime.datetime.now().isoformat(),
     })
 
@@ -328,6 +329,81 @@ def refunds_health_data():
         "active_uploads": active,
         "earliest": span["mn"],
         "latest": span["mx"],
+    })
+
+
+# ---------- Phase 3.1 — 接线量子页:坐席日报 ----------
+@app.route("/api/agents/sync", methods=["POST"])
+def agents_sync_endpoint():
+    """手动触发同步(权限 leader+);cron 也打这个。失败 raise → 5xx。"""
+    role = request.headers.get("X-User-Role")
+    if not role:
+        return jsonify({"status": "error", "message": "缺 X-User-Role header"}), 401
+    if role not in ALLOWED_ROLES:
+        return jsonify({"status": "error", "message": f"角色 {role} 无同步权限"}), 403
+
+    conn = get_conn()
+    try:
+        result = agents_sync.sync_all(conn)
+    finally:
+        conn.close()
+
+    return jsonify({
+        "status": "ok",
+        "yueda_imported": result["yueda_imported"],
+        "yueda_skipped": result["yueda_skipped"],
+        "remote_imported": result["remote_imported"],
+        "remote_skipped": result["remote_skipped"],
+        "remote_corrected": result["remote_corrected"],
+        "corrections": result["corrections"],
+        "warnings": result["warnings"],
+        "total": result["total"],
+        "synced_at": result["synced_at"],
+        "errors": [],
+    }), 200
+
+
+@app.route("/api/agents/health-data")
+def agents_health_data():
+    """前端预热用:各 source 笔数 / 日期范围 / 远程修正数 / 最近同步 / agent 数。"""
+    conn = get_conn()
+    try:
+        sources = {}
+        for src in ("yueda", "remote"):
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS count,
+                       COUNT(DISTINCT agent_name) AS agents,
+                       MIN(date_iso) AS earliest,
+                       MAX(date_iso) AS latest,
+                       COUNT(correction_note) AS corrected
+                FROM daily_reports WHERE source = ?
+                """,
+                (src,),
+            ).fetchone()
+            entry = {
+                "count": row["count"],
+                "agents": row["agents"],
+                "earliest": row["earliest"],
+                "latest": row["latest"],
+            }
+            if src == "remote":
+                entry["corrected"] = row["corrected"]
+            sources[src] = entry
+
+        agg = conn.execute(
+            "SELECT MAX(synced_at) AS synced_at, COUNT(DISTINCT agent_name) AS agents, "
+            "COUNT(*) AS total FROM daily_reports"
+        ).fetchone()
+    finally:
+        conn.close()
+
+    return jsonify({
+        "status": "ok",
+        "sources": sources,
+        "total": agg["total"],
+        "distinct_agents": agg["agents"],
+        "synced_at": agg["synced_at"],
     })
 
 

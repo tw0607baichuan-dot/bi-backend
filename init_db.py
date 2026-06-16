@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-Phase 2.2 — SQLite 资料库初始化脚本
+SQLite 资料库初始化脚本
 
-建立 /var/data/refunds/db.sqlite,含 refunds + uploads 两张表与索引。
-可重复执行(IF NOT EXISTS),不会清掉既有资料。
+Phase 2.2 — refunds + uploads(退费子系统)
+Phase 3.1 — daily_reports(接线量子页:悦达 3 班 + 远程日报)
+
+建立 /var/data/refunds/db.sqlite。可重复执行(IF NOT EXISTS),不会清掉既有资料。
 """
 import os
 import sqlite3
@@ -61,6 +63,43 @@ CREATE TABLE IF NOT EXISTS uploads (
 
 CREATE INDEX IF NOT EXISTS idx_uploads_product_week ON uploads(product_line, week_start, week_end);
 CREATE INDEX IF NOT EXISTS idx_uploads_status ON uploads(status);
+
+-- Phase 3.1 — 接线量子页:坐席日报(悦达 3 班 + 远程日报)
+CREATE TABLE IF NOT EXISTS daily_reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    -- 日期 + 提交人(核心键)
+    date_iso TEXT NOT NULL,              -- 修正后的日期(可能 = original)
+    original_date_iso TEXT,              -- 原始填写日期(被修正才有值,否则 NULL)
+    correction_note TEXT,                -- 修正说明,例 "原始抢贴 2026-06-02 → 修正为 2026-06-03"
+
+    agent_name TEXT NOT NULL,
+
+    -- 业务指标(全部可 NULL,因为原始数据可能脏)
+    intake INTEGER,
+    response_time_sec INTEGER,
+    quality_score REAL,
+    escalation_count INTEGER,
+
+    -- 班次保留(未来扩展)
+    shift TEXT,                          -- 早 / 中 / 晚 / 白 / 夜
+
+    -- 来源
+    source TEXT NOT NULL,                -- 'yueda' / 'remote'
+
+    -- 元数据
+    submit_time TEXT,                    -- 提交时间 HH:MM
+    record_time TEXT,                    -- 收錄時間(仅远程有,用来推断修正日期)
+    raw_data TEXT,                       -- 原始 row JSON
+    synced_at TEXT NOT NULL,
+
+    UNIQUE(source, date_iso, agent_name) -- 修正后零碰撞
+);
+
+CREATE INDEX IF NOT EXISTS idx_dr_date ON daily_reports(date_iso);
+CREATE INDEX IF NOT EXISTS idx_dr_agent ON daily_reports(agent_name);
+CREATE INDEX IF NOT EXISTS idx_dr_source ON daily_reports(source);
+CREATE INDEX IF NOT EXISTS idx_dr_corrected ON daily_reports(correction_note) WHERE correction_note IS NOT NULL;
 """
 
 
@@ -93,7 +132,7 @@ if __name__ == "__main__":
     print(f"DB initialized at {DB_PATH}")
     print(f"Tables : {tables}")
     print(f"Indexes: {indexes}")
-    expected = {"refunds", "uploads"}
+    expected = {"refunds", "uploads", "daily_reports"}
     if not expected.issubset(set(tables)):
         raise SystemExit(f"ERROR: missing tables, expected {expected}, got {tables}")
-    print("OK: refunds + uploads present.")
+    print("OK: refunds + uploads + daily_reports present.")
