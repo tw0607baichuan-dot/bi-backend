@@ -17,6 +17,8 @@ import sqlite3
 
 from flask import Flask, jsonify, request
 
+import agent_aliases
+import agent_queries
 import agents_sync
 import excel_parser
 import refund_queries
@@ -51,7 +53,7 @@ def _safe_component(s):
 def health():
     return jsonify({
         "status": "ok",
-        "version": "phase-3.1",
+        "version": "phase-3.2",
         "timestamp": datetime.datetime.now().isoformat(),
     })
 
@@ -405,6 +407,149 @@ def agents_health_data():
         "distinct_agents": agg["agents"],
         "synced_at": agg["synced_at"],
     })
+
+
+# ---------- Phase 3.2 — 接线量子页:查询 API + 人名合并 ----------
+def _check_role():
+    """leader+ 权限检查。通过回 (role, name);否则回 (error_json, status)。"""
+    role = request.headers.get("X-User-Role")
+    if not role:
+        return None, (jsonify({"status": "error", "message": "缺 X-User-Role header"}), 401)
+    if role not in ALLOWED_ROLES:
+        return None, (jsonify({"status": "error", "message": f"角色 {role} 无权限"}), 403)
+    name = request.headers.get("X-User-Name") or role
+    return (role, name), None
+
+
+@app.route("/api/agents/data")
+def agents_data():
+    """主查询:KPI 5 卡 + 趋势 + 客服明细 + 热力图 + 异常名单 + 守门说明。"""
+    range_key = request.args.get("range", "week")
+    start_date = request.args.get("start_date")
+    end_date = request.args.get("end_date")
+    compare_key = request.args.get("compare", "none")
+    source_filter = request.args.get("source", "all")
+    if source_filter not in ("all", "yueda", "remote"):
+        return jsonify({"status": "error", "message": f"未知 source: {source_filter}"}), 400
+    try:
+        absence_days = int(request.args.get("anomaly_days", agent_queries.DEFAULT_ABSENCE_DAYS))
+    except ValueError:
+        return jsonify({"status": "error", "message": "anomaly_days 须为整数"}), 400
+
+    try:
+        start_iso, end_iso, range_label = agent_queries.resolve_time_range(
+            range_key, start_date, end_date
+        )
+        compare_range = agent_queries.resolve_compare_range(compare_key, start_iso, end_iso)
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+
+    conn = get_conn()
+    try:
+        amap = agent_aliases.build_alias_map(conn)
+        current = agent_queries.build_period(
+            conn, start_iso, end_iso, source_filter, amap, full=True, absence_days=absence_days
+        )
+        compare = None
+        if compare_range is not None:
+            c_start, c_end, c_label = compare_range
+            compare = agent_queries.build_period(
+                conn, c_start, c_end, source_filter, amap, full=False
+            )
+            compare["label"] = c_label
+            compare["start"] = c_start
+            compare["end"] = c_end
+    finally:
+        conn.close()
+
+    return jsonify({
+        "status": "ok",
+        "range": {"label": range_label, "start": start_iso, "end": end_iso},
+        "source_filter": source_filter,
+        "current": current,
+        "compare": compare,
+    })
+
+
+@app.route("/api/agents/alias-suggestions")
+def agents_alias_suggestions():
+    """人名 fuzzy 配对建议(已排除 agent_aliases 里已决策的配对)。
+
+    默认只回强配对(同音/前缀/影子名);?include_noise=true 回全部。
+    """
+    include_noise = request.args.get("include_noise", "").lower() in ("1", "true", "yes")
+    conn = get_conn()
+    try:
+        suggestions = agent_aliases.find_alias_suggestions(conn, include_noise=include_noise)
+    finally:
+        conn.close()
+    return jsonify({
+        "status": "ok",
+        "count": len(suggestions),
+        "include_noise": include_noise,
+        "suggestions": suggestions,
+    })
+
+
+@app.route("/api/agents/aliases", methods=["GET"])
+def agents_aliases_list():
+    """列出已确认的 alias 配对(分页)。"""
+    try:
+        page = int(request.args.get("page", 1))
+        page_size = int(request.args.get("page_size", 50))
+    except ValueError:
+        return jsonify({"status": "error", "message": "page / page_size 须为整数"}), 400
+    conn = get_conn()
+    try:
+        result = agent_aliases.list_aliases(conn, page, page_size)
+    finally:
+        conn.close()
+    result["status"] = "ok"
+    return jsonify(result)
+
+
+@app.route("/api/agents/aliases", methods=["POST"])
+def agents_aliases_add():
+    """加一笔 alias(权限 leader+)。"""
+    auth, err = _check_role()
+    if err:
+        return err
+    role, name = auth
+    body = request.get_json(silent=True) or {}
+    decided_by = body.get("decided_by") or f"manual_{name}"
+    try:
+        conn = get_conn()
+        try:
+            row = agent_aliases.add_alias(
+                conn,
+                canonical_name=body.get("canonical_name"),
+                alias_name=body.get("alias_name"),
+                source=body.get("source"),
+                note=body.get("note"),
+                confidence=body.get("confidence"),
+                decided_by=decided_by,
+            )
+        finally:
+            conn.close()
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+    return jsonify({"status": "ok", "alias": row}), 200
+
+
+@app.route("/api/agents/aliases/<int:alias_id>", methods=["DELETE"])
+def agents_aliases_remove(alias_id):
+    """撤回 alias(权限 leader+)。"""
+    auth, err = _check_role()
+    if err:
+        return err
+    conn = get_conn()
+    try:
+        removed = agent_aliases.remove_alias(conn, alias_id)
+    finally:
+        conn.close()
+    if not removed:
+        return jsonify({"status": "error", "message": f"alias id={alias_id} 不存在"}), 404
+    return jsonify({"status": "ok", "removed_id": alias_id}), 200
 
 
 if __name__ == "__main__":

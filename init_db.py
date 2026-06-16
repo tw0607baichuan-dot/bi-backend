@@ -100,6 +100,22 @@ CREATE INDEX IF NOT EXISTS idx_dr_date ON daily_reports(date_iso);
 CREATE INDEX IF NOT EXISTS idx_dr_agent ON daily_reports(agent_name);
 CREATE INDEX IF NOT EXISTS idx_dr_source ON daily_reports(source);
 CREATE INDEX IF NOT EXISTS idx_dr_corrected ON daily_reports(correction_note) WHERE correction_note IS NOT NULL;
+
+-- Phase 3.2 — 人名合并(别名归一):daily_reports 原始名不动,查询时 COALESCE 到 canonical
+CREATE TABLE IF NOT EXISTS agent_aliases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    canonical_name TEXT NOT NULL,         -- 主名(查询时归一到这个)
+    alias_name TEXT NOT NULL,             -- 别名(daily_reports 里出现的原名)
+    source TEXT,                          -- 'yueda' / 'remote' / NULL(跨源都映射)
+    confidence REAL,                      -- 0.0-1.0(fuzzy 推断给的)
+    decided_by TEXT NOT NULL,             -- 'fuzzy_auto' / 'manual_baichuan' / 'manual_other'
+    decided_at TEXT NOT NULL,
+    note TEXT,                            -- 决策说明(例:'同音字归一')
+    UNIQUE(alias_name, source)            -- 一个别名只能对应一个主名
+);
+
+CREATE INDEX IF NOT EXISTS idx_aa_canonical ON agent_aliases(canonical_name);
+CREATE INDEX IF NOT EXISTS idx_aa_alias ON agent_aliases(alias_name);
 """
 
 
@@ -132,7 +148,7 @@ if __name__ == "__main__":
     print(f"DB initialized at {DB_PATH}")
     print(f"Tables : {tables}")
     print(f"Indexes: {indexes}")
-    expected = {"refunds", "uploads", "daily_reports"}
+    expected = {"refunds", "uploads", "daily_reports", "agent_aliases"}
     if not expected.issubset(set(tables)):
         raise SystemExit(f"ERROR: missing tables, expected {expected}, got {tables}")
     print("OK: refunds + uploads + daily_reports present.")
