@@ -162,6 +162,9 @@ SHEET2_ALIASES = {
 SHEET2_REQUIRED = ["agent_name"]
 
 VALID_LEVELS = {"严重", "中等", "轻微"}
+# 接受单一级别,也接受用 + 连接的复合级别(组长标记「一笔事件触及多条规则」)
+# 例:严重 / 严重+中等 / 严重+中等+轻微。本期原样存,不拆笔、不 reconcile。
+_LEVEL_RE = re.compile(r"(严重|中等|轻微)(\+(严重|中等|轻微))*")
 _APP_CODE_RE = re.compile(r"[（(]\s*([A-Za-z]{2,4}-?\d+)\s*[)）]")
 
 
@@ -314,9 +317,10 @@ def parse_quality_excel(file_bytes):
             if agent is None and level is None:
                 continue
             level = _norm(level)
-            if level not in VALID_LEVELS:
+            if not _LEVEL_RE.fullmatch(level):
                 raise QualityParseError(
-                    f"Sheet 1 错误级别无法识别:{level!r}(序号 {_cell(row, col1, 'case_no')},仅接受 严重/中等/轻微)"
+                    f"Sheet 1 错误级别无法识别:{level!r}(序号 {_cell(row, col1, 'case_no')},"
+                    f"仅接受 严重/中等/轻微,或用 + 连接的复合级别如 严重+中等)"
                 )
             ded = _to_float(_cell(row, col1, "deduction"))
             if ded is None:

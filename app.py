@@ -22,6 +22,7 @@ import agent_queries
 import agents_sync
 import excel_parser
 import quality_parser
+import quality_queries
 import refund_queries
 
 app = Flask(__name__)
@@ -59,7 +60,7 @@ def _safe_component(s):
 def health():
     return jsonify({
         "status": "ok",
-        "version": "phase-4.1",
+        "version": "phase-4.2",
         "timestamp": datetime.datetime.now().isoformat(),
     })
 
@@ -818,6 +819,76 @@ def quality_uploads_list():
     finally:
         conn.close()
     return jsonify({"status": "ok", "items": [dict(r) for r in rows]})
+
+
+# ---------- Phase 4.2:质检查询 ----------
+@app.route("/api/quality/data")
+def quality_data():
+    """主查询:KPI 5 卡 + 明细表 + 错误案例 + 错误类型分布 + 进步榜 + 守门说明。
+
+    range=today|week|last-week|month|quarter|year|ytd|custom
+    compare=none|last-week|last-month|last-quarter|last-year|yoy
+    dept=all|dx|df(本期实际只有 dx)
+    agent=<英文 username>(可选;带则只回该组员资料,给组员自查)
+    """
+    range_key = request.args.get("range", "month")
+    start_date = request.args.get("start_date")
+    end_date = request.args.get("end_date")
+    compare_key = request.args.get("compare", "none")
+    dept_filter = request.args.get("dept", "all")
+    agent_filter = request.args.get("agent") or None
+    if dept_filter not in ("all", "dx", "df"):
+        return jsonify({"status": "error", "message": f"未知 dept: {dept_filter}"}), 400
+
+    try:
+        start_iso, end_iso, range_label = quality_queries.resolve_quality_range(
+            range_key, start_date, end_date
+        )
+        compare_range = quality_queries.resolve_compare_range(compare_key, start_iso, end_iso)
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+
+    conn = get_conn()
+    try:
+        amap = agent_aliases.build_alias_map(conn)
+        current = quality_queries.build_period(
+            conn, start_iso, end_iso, dept_filter, amap, full=True, agent_filter=agent_filter
+        )
+        compare = None
+        if compare_range is not None:
+            c_start, c_end, c_label = compare_range
+            compare = quality_queries.build_period(
+                conn, c_start, c_end, dept_filter, amap, full=False, agent_filter=agent_filter
+            )
+            compare["label"] = c_label
+            compare["start"] = c_start
+            compare["end"] = c_end
+            current["improvements"] = quality_queries.get_improvements(
+                conn, start_iso, end_iso, c_start, c_end, dept_filter, amap,
+                agent_filter=agent_filter
+            )
+    finally:
+        conn.close()
+
+    return jsonify({
+        "status": "ok",
+        "range": {"label": range_label, "start": start_iso, "end": end_iso},
+        "dept_filter": dept_filter,
+        "agent_filter": agent_filter,
+        "current": current,
+        "compare": compare,
+    })
+
+
+@app.route("/api/quality/rules")
+def quality_rules():
+    """回最新 active 质检上传的 Sheet 3 评分标准原文摘要(现读原档抽取)。"""
+    conn = get_conn()
+    try:
+        rules = quality_queries.get_latest_rules(conn, QUALITY_RAW_DIR)
+    finally:
+        conn.close()
+    return jsonify({"status": "ok", **rules})
 
 
 if __name__ == "__main__":
