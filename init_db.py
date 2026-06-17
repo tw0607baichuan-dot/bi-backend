@@ -116,6 +116,115 @@ CREATE TABLE IF NOT EXISTS agent_aliases (
 
 CREATE INDEX IF NOT EXISTS idx_aa_canonical ON agent_aliases(canonical_name);
 CREATE INDEX IF NOT EXISTS idx_aa_alias ON agent_aliases(alias_name);
+
+-- Phase 4.1 — 质检子页:错误案例总表 + 客服当日汇总 + uploads metadata
+-- 镜像 refunds/uploads 模式(supersede + UNIQUE 防呆 + parser 独立档案)。
+-- agent_name 原值保留(查询时再 JOIN agent_aliases 归一,不在写入时归一以保溯源)。
+
+-- 1. 错误案例总表(每笔 = 一个具体扣分案例)
+CREATE TABLE IF NOT EXISTS quality_inspections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    upload_id INTEGER NOT NULL,            -- FK to quality_uploads
+
+    -- 审核维度
+    inspect_date TEXT NOT NULL,            -- 「审核日期」三层降级解出
+    dept TEXT NOT NULL,                    -- 'dx' / 'df'(本期写死 'dx')
+
+    -- 案例核心
+    case_no INTEGER,                       -- 序号(Excel 第一栏)
+    shift TEXT,                            -- 班别(早/中/晚/夜)
+    agent_name TEXT NOT NULL,              -- 客服中文名(原值保留)
+    agent_account TEXT,                    -- 客服账号(英文 id 例 nine9)
+    case_time TEXT,                        -- HH:MM(原始,不转 datetime)
+
+    -- 产品上下文
+    app_name TEXT,                         -- 完整 App 名(例「小蓝(DX-030)」)
+    app_code TEXT,                         -- 抽出来的产品 ID(例「DX-030」),无则 NULL
+    session_id TEXT,                       -- 会话 ID
+    user_uid TEXT,                         -- 用户 UID
+
+    -- 扣分
+    error_level TEXT NOT NULL,             -- '严重' / '中等' / '轻微'
+    deduction REAL NOT NULL,               -- 统一存负数 -3.0 / -1.5 / -0.6
+
+    -- 上下文(给主管 / 组员看)
+    error_desc TEXT,                       -- 错误描述
+    correct_reply TEXT,                    -- 正确回复方式
+    conversation TEXT,                     -- 完整对话上下文(超长文,不截断)
+
+    synced_at TEXT NOT NULL,               -- 写入时间
+
+    UNIQUE(upload_id, case_no)             -- 同上传里序号唯一,避免重复
+);
+
+CREATE INDEX IF NOT EXISTS idx_qi_date ON quality_inspections(inspect_date);
+CREATE INDEX IF NOT EXISTS idx_qi_agent ON quality_inspections(agent_name);
+CREATE INDEX IF NOT EXISTS idx_qi_dept ON quality_inspections(dept);
+CREATE INDEX IF NOT EXISTS idx_qi_level ON quality_inspections(error_level);
+CREATE INDEX IF NOT EXISTS idx_qi_session ON quality_inspections(session_id);
+
+-- 2. 客服当日汇总
+CREATE TABLE IF NOT EXISTS quality_summary (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    upload_id INTEGER NOT NULL,
+
+    inspect_date TEXT NOT NULL,
+    dept TEXT NOT NULL,                    -- 'dx' / 'df'
+
+    shift TEXT,                            -- 班别(允许「名单外」)
+    agent_name TEXT NOT NULL,              -- 原值保留
+    agent_account TEXT,
+
+    total_messages INTEGER,                -- 总讯息数
+    severe_count INTEGER DEFAULT 0,        -- 严重次数
+    medium_count INTEGER DEFAULT 0,        -- 中等次数
+    minor_count INTEGER DEFAULT 0,         -- 轻微次数
+    deduction_sum REAL DEFAULT 0,          -- 扣分总和(正数,例 6.0)
+    pass_rate REAL,                        -- 合格率(0-1,例 0.9744)
+    note TEXT,                             -- 备注(「全合格」或 NULL)
+
+    synced_at TEXT NOT NULL,
+
+    UNIQUE(upload_id, agent_name)          -- 同上传同人唯一
+);
+
+CREATE INDEX IF NOT EXISTS idx_qs_date ON quality_summary(inspect_date);
+CREATE INDEX IF NOT EXISTS idx_qs_agent ON quality_summary(agent_name);
+CREATE INDEX IF NOT EXISTS idx_qs_dept ON quality_summary(dept);
+
+-- 3. Uploads metadata(同 refunds.uploads 模式)
+CREATE TABLE IF NOT EXISTS quality_uploads (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    -- 档案
+    original_filename TEXT,
+    stored_filename TEXT,
+    file_size INTEGER,
+    md5 TEXT NOT NULL UNIQUE,              -- 防完全相同档案重复上传
+
+    -- 解析结果
+    inspect_date TEXT NOT NULL,            -- 「审核日期」(关键!supersede 基于这字段)
+    inspect_date_source TEXT,              -- 'filename' / 'metadata' / 'upload_time'(降级标识)
+    dept TEXT NOT NULL,                    -- 'dx' / 'df'
+
+    -- 笔数统计
+    inspections_count INTEGER,             -- Sheet 1 入了几笔
+    summary_count INTEGER,                 -- Sheet 2 入了几笔
+
+    -- 谁传的 / 何时
+    uploaded_by_role TEXT NOT NULL,
+    uploaded_by_user TEXT NOT NULL,        -- 英文 username
+    uploaded_at TEXT NOT NULL,
+
+    -- 生命周期
+    status TEXT NOT NULL DEFAULT 'active', -- 'active' / 'superseded' / 'deleted'
+    superseded_by INTEGER,                 -- supersede 时记录被哪个 upload 覆盖
+    superseded_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_qu_inspect_date ON quality_uploads(inspect_date);
+CREATE INDEX IF NOT EXISTS idx_qu_status ON quality_uploads(status);
+CREATE INDEX IF NOT EXISTS idx_qu_dept ON quality_uploads(dept);
 """
 
 
@@ -148,7 +257,10 @@ if __name__ == "__main__":
     print(f"DB initialized at {DB_PATH}")
     print(f"Tables : {tables}")
     print(f"Indexes: {indexes}")
-    expected = {"refunds", "uploads", "daily_reports", "agent_aliases"}
+    expected = {
+        "refunds", "uploads", "daily_reports", "agent_aliases",
+        "quality_inspections", "quality_summary", "quality_uploads",
+    }
     if not expected.issubset(set(tables)):
         raise SystemExit(f"ERROR: missing tables, expected {expected}, got {tables}")
-    print("OK: refunds + uploads + daily_reports present.")
+    print("OK: refunds + uploads + daily_reports + quality_* present.")

@@ -21,6 +21,7 @@ import agent_aliases
 import agent_queries
 import agents_sync
 import excel_parser
+import quality_parser
 import refund_queries
 
 app = Flask(__name__)
@@ -30,6 +31,11 @@ DATA_DIR = "/var/data/refunds"
 DB_PATH = os.path.join(DATA_DIR, "db.sqlite")
 RAW_DIR = os.path.join(DATA_DIR, "raw")
 ARCHIVE_DIR = os.path.join(DATA_DIR, "archive")
+
+# Phase 4.1 — 质检子系统(独立 data 目录,同 refunds 模式)
+QUALITY_DIR = "/var/data/quality"
+QUALITY_RAW_DIR = os.path.join(QUALITY_DIR, "raw")
+QUALITY_ARCHIVE_DIR = os.path.join(QUALITY_DIR, "archive")
 
 ALLOWED_ROLES = {"superadmin", "manager", "maintainer", "leader"}
 
@@ -53,7 +59,7 @@ def _safe_component(s):
 def health():
     return jsonify({
         "status": "ok",
-        "version": "phase-3.2",
+        "version": "phase-4.1",
         "timestamp": datetime.datetime.now().isoformat(),
     })
 
@@ -550,6 +556,268 @@ def agents_aliases_remove(alias_id):
     if not removed:
         return jsonify({"status": "error", "message": f"alias id={alias_id} 不存在"}), 404
     return jsonify({"status": "ok", "removed_id": alias_id}), 200
+
+
+# ════════════════════════════════════════════════════════════════
+#  Phase 4.1 — 质检子页:上传 + 解析 + 健康检查 + uploads 清单
+#  镜像 refunds 上传模式(supersede + UNIQUE 防呆 + 独立 parser)。
+#  agent_name 原值保留,查询归一留 4.2。
+# ════════════════════════════════════════════════════════════════
+@app.route("/api/quality/upload", methods=["POST"])
+def upload_quality():
+    # 1) 权限(leader+,同退费)
+    role = request.headers.get("X-User-Role")
+    if not role:
+        return jsonify({"status": "error", "message": "缺 X-User-Role header"}), 401
+    if role not in ALLOWED_ROLES:
+        return jsonify({"status": "error", "message": f"角色 {role} 无上传权限"}), 403
+    uploaded_by = request.headers.get("X-User-Name") or role
+
+    # 2) 取档 → bytes → md5 + size
+    if "file" not in request.files:
+        return jsonify({"status": "error", "message": "未带 file"}), 400
+    f = request.files["file"]
+    original_filename = f.filename or ""
+    if not original_filename:
+        return jsonify({"status": "error", "message": "档名为空"}), 400
+    file_bytes = f.read()
+    if not file_bytes:
+        return jsonify({"status": "error", "message": "档案为空"}), 400
+    file_md5 = hashlib.md5(file_bytes).hexdigest()
+    file_size = len(file_bytes)
+
+    now_iso = datetime.datetime.now().isoformat()
+    dept = "dx"   # 本期写死(1-1 部 DX 系)
+
+    conn = get_conn()
+    try:
+        # 3) md5 重复上传检查(写档前)
+        dup = conn.execute(
+            "SELECT id FROM quality_uploads WHERE md5 = ? AND status != 'deleted'",
+            (file_md5,),
+        ).fetchone()
+        if dup:
+            return jsonify({
+                "status": "error",
+                "message": f"档案已上传过(md5 重复,upload_id={dup['id']})",
+            }), 409
+
+        # 4) 「审核日期」三层降级
+        inspect_date, date_source = quality_parser.resolve_inspect_date(
+            original_filename, file_bytes, now_iso
+        )
+
+        # 5) 解析 Excel(3 sheet)
+        try:
+            parsed = quality_parser.parse_quality_excel(file_bytes)
+        except quality_parser.QualityParseError as e:
+            return jsonify({"status": "error", "message": f"解析失败:{e}"}), 400
+        except Exception as e:
+            return jsonify({"status": "error", "message": f"档案损坏 / 无法解析:{e}"}), 400
+
+        s1 = parsed["sheet1_rows"]
+        s2 = parsed["sheet2_rows"]
+
+        # 8) 存原档(server 生成档名,防路径穿越)
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        stored_filename = (
+            f"{_safe_component(inspect_date)}_{_safe_component(dept)}_{timestamp}.xlsx"
+        )
+        os.makedirs(QUALITY_RAW_DIR, exist_ok=True)
+        os.makedirs(QUALITY_ARCHIVE_DIR, exist_ok=True)
+        stored_path = os.path.join(QUALITY_RAW_DIR, stored_filename)
+        with open(stored_path, "wb") as out:
+            out.write(file_bytes)
+
+        # 10) INSERT quality_uploads 取 upload_id
+        cur = conn.execute(
+            """
+            INSERT INTO quality_uploads (
+                original_filename, stored_filename, file_size, md5,
+                inspect_date, inspect_date_source, dept,
+                inspections_count, summary_count,
+                uploaded_by_role, uploaded_by_user, uploaded_at, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, 'active')
+            """,
+            (
+                original_filename, stored_filename, file_size, file_md5,
+                inspect_date, date_source, dept,
+                role, uploaded_by, now_iso,
+            ),
+        )
+        upload_id = cur.lastrowid
+
+        # 11) INSERT quality_inspections(UNIQUE(upload_id, case_no) 防呆)
+        conn.executemany(
+            """
+            INSERT OR IGNORE INTO quality_inspections (
+                upload_id, inspect_date, dept, case_no, shift,
+                agent_name, agent_account, case_time, app_name, app_code,
+                session_id, user_uid, error_level, deduction,
+                error_desc, correct_reply, conversation, synced_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    upload_id, inspect_date, dept, r["case_no"], r["shift"],
+                    r["agent_name"], r["agent_account"], r["case_time"],
+                    r["app_name"], r["app_code"], r["session_id"], r["user_uid"],
+                    r["error_level"], r["deduction"],
+                    r["error_desc"], r["correct_reply"], r["conversation"], now_iso,
+                )
+                for r in s1
+            ],
+        )
+        inspections_count = conn.execute(
+            "SELECT COUNT(*) AS c FROM quality_inspections WHERE upload_id = ?", (upload_id,)
+        ).fetchone()["c"]
+
+        # 12) INSERT quality_summary(UNIQUE(upload_id, agent_name) 防呆)
+        conn.executemany(
+            """
+            INSERT OR IGNORE INTO quality_summary (
+                upload_id, inspect_date, dept, shift, agent_name, agent_account,
+                total_messages, severe_count, medium_count, minor_count,
+                deduction_sum, pass_rate, note, synced_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    upload_id, inspect_date, dept, r["shift"], r["agent_name"],
+                    r["agent_account"], r["total_messages"], r["severe_count"],
+                    r["medium_count"], r["minor_count"], r["deduction_sum"],
+                    r["pass_rate"], r["note"], now_iso,
+                )
+                for r in s2
+            ],
+        )
+        summary_count = conn.execute(
+            "SELECT COUNT(*) AS c FROM quality_summary WHERE upload_id = ?", (upload_id,)
+        ).fetchone()["c"]
+
+        conn.execute(
+            "UPDATE quality_uploads SET inspections_count = ?, summary_count = ? WHERE id = ?",
+            (inspections_count, summary_count, upload_id),
+        )
+
+        # 9) supersede:同 inspect_date + dept 的旧 active → superseded,原档归档
+        olds = conn.execute(
+            """
+            SELECT id, stored_filename FROM quality_uploads
+            WHERE inspect_date = ? AND dept = ? AND status = 'active' AND id != ?
+            """,
+            (inspect_date, dept, upload_id),
+        ).fetchall()
+        superseded_old_id = None
+        for old in olds:
+            conn.execute(
+                "UPDATE quality_uploads SET status = 'superseded', "
+                "superseded_by = ?, superseded_at = ? WHERE id = ?",
+                (upload_id, now_iso, old["id"]),
+            )
+            superseded_old_id = old["id"]   # 通常只有一笔
+            if old["stored_filename"]:
+                old_path = os.path.join(QUALITY_RAW_DIR, old["stored_filename"])
+                if os.path.exists(old_path):
+                    try:
+                        os.replace(old_path, os.path.join(QUALITY_ARCHIVE_DIR, old["stored_filename"]))
+                    except OSError:
+                        pass   # 归档失败不影响主流程
+
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    return jsonify({
+        "status": "ok",
+        "upload_id": upload_id,
+        "inspect_date": inspect_date,
+        "inspect_date_source": date_source,
+        "dept": dept,
+        "inspections_count": inspections_count,
+        "summary_count": summary_count,
+        "superseded_old_id": superseded_old_id,
+        "sheet3_present": parsed["sheet3_rules"] is not None,
+        "message": (
+            f"审核日期 {inspect_date}(来源:{date_source})· "
+            f"案例 {inspections_count} 笔 · 汇总 {summary_count} 人"
+            + (f" · 覆盖旧上传 {superseded_old_id}" if superseded_old_id else "")
+        ),
+    }), 200
+
+
+@app.route("/api/quality/health-data", methods=["GET"])
+def quality_health_data():
+    """前端预热:active uploads / 笔数 / 各 dept 范围 / 最新审核日 / 最近上传。"""
+    conn = get_conn()
+    try:
+        total_uploads_active = conn.execute(
+            "SELECT COUNT(*) AS c FROM quality_uploads WHERE status = 'active'"
+        ).fetchone()["c"]
+        # 只算 active upload 名下的明细(supersede 教训:查询一律 active filter)
+        total_inspections = conn.execute(
+            "SELECT COUNT(*) AS c FROM quality_inspections "
+            "WHERE upload_id IN (SELECT id FROM quality_uploads WHERE status = 'active')"
+        ).fetchone()["c"]
+        total_summary = conn.execute(
+            "SELECT COUNT(*) AS c FROM quality_summary "
+            "WHERE upload_id IN (SELECT id FROM quality_uploads WHERE status = 'active')"
+        ).fetchone()["c"]
+
+        depts = {}
+        for row in conn.execute(
+            """
+            SELECT dept, COUNT(*) AS count,
+                   MIN(inspect_date) AS earliest, MAX(inspect_date) AS latest
+            FROM quality_uploads WHERE status = 'active' GROUP BY dept
+            """
+        ).fetchall():
+            depts[row["dept"]] = {
+                "count": row["count"],
+                "earliest": row["earliest"],
+                "latest": row["latest"],
+            }
+
+        agg = conn.execute(
+            "SELECT MAX(inspect_date) AS latest_inspect_date, MAX(uploaded_at) AS last_upload_at "
+            "FROM quality_uploads WHERE status = 'active'"
+        ).fetchone()
+    finally:
+        conn.close()
+
+    return jsonify({
+        "status": "ok",
+        "total_uploads_active": total_uploads_active,
+        "total_inspections": total_inspections,
+        "total_summary": total_summary,
+        "depts": depts,
+        "latest_inspect_date": agg["latest_inspect_date"],
+        "last_upload_at": agg["last_upload_at"],
+    })
+
+
+@app.route("/api/quality/uploads-list", methods=["GET"])
+def quality_uploads_list():
+    """列出 status='active' 的 uploads metadata(供前端选档管理)。"""
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, original_filename, stored_filename, file_size, md5,
+                   inspect_date, inspect_date_source, dept,
+                   inspections_count, summary_count,
+                   uploaded_by_role, uploaded_by_user, uploaded_at, status
+            FROM quality_uploads
+            WHERE status = 'active'
+            ORDER BY inspect_date DESC, uploaded_at DESC
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+    return jsonify({"status": "ok", "items": [dict(r) for r in rows]})
 
 
 if __name__ == "__main__":
