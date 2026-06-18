@@ -891,5 +891,90 @@ def quality_rules():
     return jsonify({"status": "ok", **rules})
 
 
+# ---------- Bug#2a — SYS-02 当月 tab gid 解析 ----------
+SYS02_SHEET_ID = "1lKjyN-jDX4IliiNvOehXmyV9dOLIFn1J0syvCLdjWzk"
+
+# Sheet HTML 内每个 tab 的结构(已勘查验证):
+#   [<idx>,0,\"<gid>\",[{\"1\":[[0,0,\"<tab名>\"
+# tab 命名实测为 '26年X月回复量';解析时容忍多种月份写法。
+_SYS02_TAB_RE = re.compile(
+    r'\[\d+,0,\\"(\d+)\\",\[\{\\"1\\":\[\[0,0,\\"([^\\]+?)\\"'
+)
+
+
+def _sys02_parse_ym(name):
+    """从 tab 名抽 (year, month);容忍 '26年6月回复量'/'2026/06'/'06月' 等变体。"""
+    m = re.search(r"(\d{2})年(\d{1,2})月", name)
+    if m:
+        return (2000 + int(m.group(1)), int(m.group(2)))
+    m = re.search(r"(\d{4})[/\-年](\d{1,2})", name)
+    if m:
+        return (int(m.group(1)), int(m.group(2)))
+    m = re.search(r"^0?(\d{1,2})月", name.strip())
+    if m:
+        return (datetime.datetime.now().year, int(m.group(1)))
+    return None
+
+
+@app.route("/api/sys02/current-month-gid", methods=["GET"])
+def sys02_current_month_gid():
+    """
+    拉 Sheet HTML 解析 tab 清单,找出当月 tab 的 gid。
+    回 { ok, gid, tab_name, month, year, sheet_id }
+    找不到当月则回 { ok:false, message, fallback_gid, fallback_tab_name } (HTTP 200)。
+    """
+    import requests
+
+    now = datetime.datetime.now()
+    year, month = now.year, now.month
+
+    try:
+        r = requests.get(
+            f"https://docs.google.com/spreadsheets/d/{SYS02_SHEET_ID}/edit",
+            timeout=15,
+        )
+    except Exception as e:
+        return jsonify({"ok": False, "message": f"Sheet 拉取异常: {e}"}), 500
+
+    if r.status_code != 200:
+        return jsonify({"ok": False, "message": f"Sheet 拉取失败: HTTP {r.status_code}"}), 500
+
+    # 抽所有 (gid, tab名) 配对并解析年月;按 gid 去重
+    tabs = []  # [(year, month, gid, name)]
+    seen = set()
+    for gid, name in _SYS02_TAB_RE.findall(r.text):
+        if gid in seen:
+            continue
+        ym = _sys02_parse_ym(name)
+        if not ym:
+            continue
+        seen.add(gid)
+        tabs.append((ym[0], ym[1], gid, name))
+
+    if not tabs:
+        return jsonify({"ok": False, "message": "Sheet 内未解析到任何 tab,HTML 结构可能已变"}), 500
+
+    target = next((t for t in tabs if t[0] == year and t[1] == month), None)
+    if target:
+        y, mo, gid, name = target
+        return jsonify({
+            "ok": True,
+            "gid": gid,
+            "tab_name": name,
+            "month": mo,
+            "year": y,
+            "sheet_id": SYS02_SHEET_ID,
+        })
+
+    latest = sorted(tabs, key=lambda t: (t[0], t[1]), reverse=True)[0]
+    return jsonify({
+        "ok": False,
+        "message": f"当月 ({year}/{month:02d}) tab 未建立,最新为 {latest[3]}",
+        "fallback_gid": latest[2],
+        "fallback_tab_name": latest[3],
+        "sheet_id": SYS02_SHEET_ID,
+    })
+
+
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=5000)
