@@ -922,16 +922,23 @@ def _sys02_parse_ym(name):
     return None
 
 
-def _resolve_current_gid(sheet_id):
-    """共用:拉 sheet HTML 解析 tab 清单,找出当月 tab 的 gid。
+def _resolve_current_gid(sheet_id, prev=False):
+    """共用:拉 sheet HTML 解析 tab 清单,找出目标月 tab 的 gid。
        Args: sheet_id (str) - Google Sheet ID
+             prev (bool)    - True 时找「当月-1 月」的 tab(月环比用),
+                              含跨年回退(1月 prev → 去年 12月)。
        Returns: Flask JSON { ok, gid, tab_name, month, year, sheet_id };
-                找不到当月则 ok=False + fallback_gid (最新 tab) (HTTP 200);
+                找不到目标月则 ok=False + fallback_gid (最新 tab) (HTTP 200);
                 拉取/解析失败回 500。"""
     import requests
 
     now = datetime.datetime.now()
     year, month = now.year, now.month
+    if prev:
+        target_year = year if month > 1 else year - 1
+        target_month = (month - 1) or 12
+    else:
+        target_year, target_month = year, month
 
     try:
         r = requests.get(
@@ -959,7 +966,7 @@ def _resolve_current_gid(sheet_id):
     if not tabs:
         return jsonify({"ok": False, "message": "Sheet 内未解析到任何 tab,HTML 结构可能已变"}), 500
 
-    target = next((t for t in tabs if t[0] == year and t[1] == month), None)
+    target = next((t for t in tabs if t[0] == target_year and t[1] == target_month), None)
     if target:
         y, mo, gid, name = target
         return jsonify({
@@ -974,7 +981,7 @@ def _resolve_current_gid(sheet_id):
     latest = sorted(tabs, key=lambda t: (t[0], t[1]), reverse=True)[0]
     return jsonify({
         "ok": False,
-        "message": f"当月 ({year}/{month:02d}) tab 未建立,最新为 {latest[3]}",
+        "message": f"目标月 ({target_year}/{target_month:02d}) tab 未建立,最新为 {latest[3]}",
         "fallback_gid": latest[2],
         "fallback_tab_name": latest[3],
         "sheet_id": sheet_id,
@@ -985,6 +992,7 @@ def _resolve_current_gid(sheet_id):
 def current_month_gid():
     """泛化版,?sheet=<key> 白名单 reply/ops"""
     key = request.args.get("sheet")
+    prev = request.args.get("prev", "").lower() == "true"
     if not key:
         return jsonify({"ok": False, "message": "缺少 sheet 参数"}), 400
     sheet_id = SHEET_WHITELIST.get(key)
@@ -993,7 +1001,7 @@ def current_month_gid():
             "ok": False,
             "message": f"未知 sheet '{key}',允许: {list(SHEET_WHITELIST.keys())}",
         }), 400
-    return _resolve_current_gid(sheet_id)
+    return _resolve_current_gid(sheet_id, prev=prev)
 
 
 @app.route("/api/sys02/current-month-gid", methods=["GET"])
