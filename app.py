@@ -894,6 +894,12 @@ def quality_rules():
 # ---------- Bug#2a — SYS-02 当月 tab gid 解析 ----------
 SYS02_SHEET_ID = "1lKjyN-jDX4IliiNvOehXmyV9dOLIFn1J0syvCLdjWzk"
 
+# 段B 泛化:白名单(防 SSRF/proxy 滥用,只允许已知 Sheet)
+SHEET_WHITELIST = {
+    "reply": "1lKjyN-jDX4IliiNvOehXmyV9dOLIFn1J0syvCLdjWzk",
+    "ops":   "19KeuX9iq7U-ox4IFOIUEVhNMm-kgSJhBNWtsC9h9g40",
+}
+
 # Sheet HTML 内每个 tab 的结构(已勘查验证):
 #   [<idx>,0,\"<gid>\",[{\"1\":[[0,0,\"<tab名>\"
 # tab 命名实测为 '26年X月回复量';解析时容忍多种月份写法。
@@ -916,13 +922,12 @@ def _sys02_parse_ym(name):
     return None
 
 
-@app.route("/api/sys02/current-month-gid", methods=["GET"])
-def sys02_current_month_gid():
-    """
-    拉 Sheet HTML 解析 tab 清单,找出当月 tab 的 gid。
-    回 { ok, gid, tab_name, month, year, sheet_id }
-    找不到当月则回 { ok:false, message, fallback_gid, fallback_tab_name } (HTTP 200)。
-    """
+def _resolve_current_gid(sheet_id):
+    """共用:拉 sheet HTML 解析 tab 清单,找出当月 tab 的 gid。
+       Args: sheet_id (str) - Google Sheet ID
+       Returns: Flask JSON { ok, gid, tab_name, month, year, sheet_id };
+                找不到当月则 ok=False + fallback_gid (最新 tab) (HTTP 200);
+                拉取/解析失败回 500。"""
     import requests
 
     now = datetime.datetime.now()
@@ -930,7 +935,7 @@ def sys02_current_month_gid():
 
     try:
         r = requests.get(
-            f"https://docs.google.com/spreadsheets/d/{SYS02_SHEET_ID}/edit",
+            f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit",
             timeout=15,
         )
     except Exception as e:
@@ -963,7 +968,7 @@ def sys02_current_month_gid():
             "tab_name": name,
             "month": mo,
             "year": y,
-            "sheet_id": SYS02_SHEET_ID,
+            "sheet_id": sheet_id,
         })
 
     latest = sorted(tabs, key=lambda t: (t[0], t[1]), reverse=True)[0]
@@ -972,8 +977,29 @@ def sys02_current_month_gid():
         "message": f"当月 ({year}/{month:02d}) tab 未建立,最新为 {latest[3]}",
         "fallback_gid": latest[2],
         "fallback_tab_name": latest[3],
-        "sheet_id": SYS02_SHEET_ID,
+        "sheet_id": sheet_id,
     })
+
+
+@app.route("/api/current-month-gid", methods=["GET"])
+def current_month_gid():
+    """泛化版,?sheet=<key> 白名单 reply/ops"""
+    key = request.args.get("sheet")
+    if not key:
+        return jsonify({"ok": False, "message": "缺少 sheet 参数"}), 400
+    sheet_id = SHEET_WHITELIST.get(key)
+    if not sheet_id:
+        return jsonify({
+            "ok": False,
+            "message": f"未知 sheet '{key}',允许: {list(SHEET_WHITELIST.keys())}",
+        }), 400
+    return _resolve_current_gid(sheet_id)
+
+
+@app.route("/api/sys02/current-month-gid", methods=["GET"])
+def sys02_current_month_gid():
+    """旧 endpoint 保留(前端 SYS-02/03 沿用),内部转 reply 表。"""
+    return _resolve_current_gid(SHEET_WHITELIST["reply"])
 
 
 if __name__ == "__main__":
