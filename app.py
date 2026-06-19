@@ -11,6 +11,7 @@ BI Dashboard Backend — Phase 2.2
 import datetime
 import hashlib
 import io
+import json
 import os
 import re
 import sqlite3
@@ -748,6 +749,19 @@ def upload_quality():
             + (f" · 覆盖旧上传 {superseded_old_id}" if superseded_old_id else "")
         ),
     }), 200
+
+
+@app.route("/api/quality/drive_sync_status", methods=["GET"])
+def quality_drive_sync_status():
+    """Phase 4.4 — 回 Drive 自动同步最近一次状态(由 quality_drive_sync.py 写的状态档)。"""
+    status_path = os.path.join(QUALITY_DIR, "drive_sync_status.json")
+    if not os.path.exists(status_path):
+        return jsonify({"ok": False, "message": "尚未同步"}), 200
+    try:
+        with open(status_path, encoding="utf-8") as f:
+            return jsonify({"ok": True, **json.load(f)}), 200
+    except (OSError, ValueError) as e:
+        return jsonify({"ok": False, "message": f"状态档读取失败:{e}"}), 200
 
 
 @app.route("/api/quality/health-data", methods=["GET"])
