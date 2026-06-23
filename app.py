@@ -905,6 +905,120 @@ def quality_rules():
     return jsonify({"status": "ok", **rules})
 
 
+@app.route("/api/quality/monthly_ranking", methods=["GET"])
+def quality_monthly_ranking():
+    """Phase 13-2 月度排名 endpoint。
+    沿用 quality_queries 四件套(resolve_quality_range + _fetch_summary
+    + _agg_summary + get_summary_table),公式跟 Excel 官方一致:
+        score = pass_rate × 100 = (1 - Σdeduction_sum / Σtotal_messages) × 100
+    """
+    month = request.args.get("month")  # 例 '2026-06',或省略 = 当月
+    dept_filter = request.args.get("dept", "dx")
+
+    # dept 验证
+    if dept_filter not in ("all", "dx", "df"):
+        return jsonify({"status": "error", "message": "dept 必须 all/dx/df"}), 400
+
+    # month parse → 月份起讫
+    if month:
+        try:
+            y, m = month.split("-")
+            y, m = int(y), int(m)
+            if not (1 <= m <= 12):
+                raise ValueError("month 超出 1-12")
+            start_iso = f"{y:04d}-{m:02d}-01"
+            # 月底 = 次月 1 号 - 1 天
+            nxt = f"{y + 1:04d}-01-01" if m == 12 else f"{y:04d}-{m + 1:02d}-01"
+            end_iso = (datetime.datetime.strptime(nxt, "%Y-%m-%d")
+                       - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+        except (ValueError, IndexError):
+            return jsonify({"status": "error", "message": "month 格式 YYYY-MM"}), 400
+    else:
+        # 没传 month → 用当月
+        start_iso, end_iso, _ = quality_queries.resolve_quality_range("month", None, None)
+
+    conn = get_conn()
+    try:
+        amap = agent_aliases.build_alias_map(conn)
+        canon_of = lambda n: agent_aliases.resolve_name(n, None, amap)  # noqa: E731
+
+        rows = quality_queries._fetch_summary(conn, start_iso, end_iso, dept_filter)
+        # _agg_summary 聚合后丢了原始 account;先从 raw rows 建 canon→account 映射补回
+        acct_of = {}
+        for r in rows:
+            c = canon_of(r["agent_name"])
+            if r["agent_account"] and c not in acct_of:
+                acct_of[c] = r["agent_account"]
+
+        summary_agg = quality_queries._agg_summary(rows, canon_of)
+        table = quality_queries.get_summary_table(summary_agg)
+        # get_summary_table 是 pass_rate 升序(差的在前);排名要降序(好的第一名)。
+        # 显式排序比 reversed() 稳:None(无资料)永远沉底,同分用讯息量多者优先。
+        table_desc = sorted(
+            table,
+            key=lambda r: (
+                r.get("pass_rate") is None,
+                -(r.get("pass_rate") or 0),
+                -(r.get("total_messages") or 0),
+                r.get("canonical_name") or "",
+            ),
+        )
+
+        # 加排名序号 + 算「月度绩效分」(= pass_rate × 100)
+        ranking = []
+        for i, row in enumerate(table_desc, start=1):
+            pr = row.get("pass_rate") or 0
+            name = row.get("canonical_name", "")
+            ranking.append({
+                "rank": i,
+                "agent_name": name,
+                "agent_account": acct_of.get(name, ""),
+                "shift": row.get("shift") or "",
+                "total_messages": row.get("total_messages", 0),
+                "severe_count": row.get("severe_count", 0),
+                "medium_count": row.get("medium_count", 0),
+                "minor_count": row.get("minor_count", 0),
+                "deduction_sum": round(row.get("deduction_sum", 0), 1),
+                "pass_rate_pct": round(pr * 100, 2),
+                "score": round(pr * 100, 2),  # = pass_rate_pct 同值
+            })
+
+        # KPI:本月覆盖天数 / 总严重 / 团队加权合格率 / 第一名
+        if dept_filter in ("dx", "df"):
+            cov_sql = ("SELECT COUNT(DISTINCT inspect_date) FROM quality_uploads "
+                       "WHERE status='active' AND inspect_date >= ? AND inspect_date <= ? "
+                       "AND dept = ?")
+            cov_args = (start_iso, end_iso, dept_filter)
+        else:
+            cov_sql = ("SELECT COUNT(DISTINCT inspect_date) FROM quality_uploads "
+                       "WHERE status='active' AND inspect_date >= ? AND inspect_date <= ?")
+            cov_args = (start_iso, end_iso)
+        coverage_days = conn.execute(cov_sql, cov_args).fetchone()[0] or 0
+
+        total_severe = sum(r["severe_count"] for r in ranking)
+        total_msg = sum(r["total_messages"] for r in ranking)
+        total_ded = sum(r["deduction_sum"] for r in ranking)
+        team_rate = round((1 - total_ded / total_msg) * 100, 2) if total_msg else 0
+        top = ranking[0] if ranking else None
+
+        return jsonify({
+            "status": "ok",
+            "month": start_iso[:7],  # 例 "2026-06"
+            "range": {"start": start_iso, "end": end_iso},
+            "dept_filter": dept_filter,
+            "kpi": {
+                "coverage_days": coverage_days,
+                "total_severe": total_severe,
+                "team_pass_rate_pct": team_rate,
+                "top_agent": {"name": top["agent_name"], "score": top["score"]} if top else None,
+            },
+            "ranking": ranking,
+            "ranking_count": len(ranking),
+        })
+    finally:
+        conn.close()
+
+
 # ---------- Bug#2a — SYS-02 当月 tab gid 解析 ----------
 SYS02_SHEET_ID = "1lKjyN-jDX4IliiNvOehXmyV9dOLIFn1J0syvCLdjWzk"
 
