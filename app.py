@@ -39,6 +39,10 @@ QUALITY_DIR = "/var/data/quality"
 QUALITY_RAW_DIR = os.path.join(QUALITY_DIR, "raw")
 QUALITY_ARCHIVE_DIR = os.path.join(QUALITY_DIR, "archive")
 
+# Phase 13-2:月度排名「低访问量」门槛。讯息 < 此值自动进 low_volume,不进主榜。
+# 完全靠门槛过滤(不维护写死排除清单),新 Excel 帐号按讯息量自动分流,0 维护成本。
+QUALITY_RANKING_MIN_MESSAGES_DEFAULT = 50
+
 ALLOWED_ROLES = {"superadmin", "manager", "maintainer", "leader"}
 
 
@@ -919,6 +923,15 @@ def quality_monthly_ranking():
     if dept_filter not in ("all", "dx", "df"):
         return jsonify({"status": "error", "message": "dept 必须 all/dx/df"}), 400
 
+    # min_messages 验证(低访问量门槛,可调;默认 QUALITY_RANKING_MIN_MESSAGES_DEFAULT)
+    min_msg_str = request.args.get("min_messages")
+    try:
+        min_msg = int(min_msg_str) if min_msg_str else QUALITY_RANKING_MIN_MESSAGES_DEFAULT
+        if min_msg < 0:
+            return jsonify({"status": "error", "message": "min_messages 必须 >= 0"}), 400
+    except ValueError:
+        return jsonify({"status": "error", "message": "min_messages 必须整数"}), 400
+
     # month parse → 月份起讫
     if month:
         try:
@@ -964,24 +977,35 @@ def quality_monthly_ranking():
             ),
         )
 
-        # 加排名序号 + 算「月度绩效分」(= pass_rate × 100)
-        ranking = []
-        for i, row in enumerate(table_desc, start=1):
+        # 算「月度绩效分」(= pass_rate × 100)+ 按门槛分流主榜 / 低访问量
+        ranking = []           # 主榜(讯息 >= min_msg)
+        low_volume = []        # 资料不足(讯息 < min_msg)
+        rank_counter = 0
+        for row in table_desc:
             pr = row.get("pass_rate") or 0
             name = row.get("canonical_name", "")
-            ranking.append({
-                "rank": i,
+            total_msg = row.get("total_messages", 0)
+            entry = {
                 "agent_name": name,
                 "agent_account": acct_of.get(name, ""),
                 "shift": row.get("shift") or "",
-                "total_messages": row.get("total_messages", 0),
+                "total_messages": total_msg,
                 "severe_count": row.get("severe_count", 0),
                 "medium_count": row.get("medium_count", 0),
                 "minor_count": row.get("minor_count", 0),
                 "deduction_sum": round(row.get("deduction_sum", 0), 1),
                 "pass_rate_pct": round(pr * 100, 2),
                 "score": round(pr * 100, 2),  # = pass_rate_pct 同值
-            })
+            }
+            if total_msg >= min_msg:
+                rank_counter += 1
+                entry["rank"] = rank_counter
+                ranking.append(entry)
+            else:
+                low_volume.append(entry)
+
+        # low_volume 按讯息量降序(table_desc 是合格率序,低量区改看量)
+        low_volume.sort(key=lambda x: -x["total_messages"])
 
         # KPI:本月覆盖天数 / 总严重 / 团队加权合格率 / 第一名
         if dept_filter in ("dx", "df"):
@@ -995,10 +1019,11 @@ def quality_monthly_ranking():
             cov_args = (start_iso, end_iso)
         coverage_days = conn.execute(cov_sql, cov_args).fetchone()[0] or 0
 
+        # KPI 只算主榜(低访问量不影响团队指标)
         total_severe = sum(r["severe_count"] for r in ranking)
-        total_msg = sum(r["total_messages"] for r in ranking)
+        total_msg_sum = sum(r["total_messages"] for r in ranking)
         total_ded = sum(r["deduction_sum"] for r in ranking)
-        team_rate = round((1 - total_ded / total_msg) * 100, 2) if total_msg else 0
+        team_rate = round((1 - total_ded / total_msg_sum) * 100, 2) if total_msg_sum else 0
         top = ranking[0] if ranking else None
 
         return jsonify({
@@ -1006,6 +1031,7 @@ def quality_monthly_ranking():
             "month": start_iso[:7],  # 例 "2026-06"
             "range": {"start": start_iso, "end": end_iso},
             "dept_filter": dept_filter,
+            "min_messages": min_msg,
             "kpi": {
                 "coverage_days": coverage_days,
                 "total_severe": total_severe,
@@ -1014,6 +1040,8 @@ def quality_monthly_ranking():
             },
             "ranking": ranking,
             "ranking_count": len(ranking),
+            "low_volume": low_volume,
+            "low_volume_count": len(low_volume),
         })
     finally:
         conn.close()
