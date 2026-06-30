@@ -15,10 +15,12 @@ import json
 import os
 import re
 import sqlite3
+from collections import defaultdict
 
 from flask import Flask, jsonify, request
 
 import agent_aliases
+from agent_grouping import GROUP_KEYS, filter_agents_by_group
 import agent_queries
 import agents_sync
 import excel_parser
@@ -443,6 +445,12 @@ def agents_data():
     source_filter = request.args.get("source", "all")
     if source_filter not in ("all", "yueda", "remote"):
         return jsonify({"status": "error", "message": f"未知 source: {source_filter}"}), 400
+    group_filter = request.args.get("group", "all")
+    if group_filter not in GROUP_KEYS:
+        return jsonify({
+            "status": "error",
+            "message": "group 必须 all/11_morning/11_mid/11_night/11_remote/12_remote",
+        }), 400
     try:
         absence_days = int(request.args.get("anomaly_days", agent_queries.DEFAULT_ABSENCE_DAYS))
     except ValueError:
@@ -474,13 +482,69 @@ def agents_data():
     finally:
         conn.close()
 
-    return jsonify({
+    result = {
         "status": "ok",
         "range": {"label": range_label, "start": start_iso, "end": end_iso},
         "source_filter": source_filter,
         "current": current,
         "compare": compare,
-    })
+    }
+
+    if group_filter != "all":
+        # 过滤 agents_table 到该群
+        result["current"]["agents_table"] = filter_agents_by_group(
+            result["current"]["agents_table"], group_filter
+        )
+        filtered = result["current"]["agents_table"]
+
+        # 重算 KPI(基于过滤后的 agents)
+        if filtered:
+            resp_vals = [a["avg_response_sec"] for a in filtered if a.get("avg_response_sec")]
+            qual_vals = [a["avg_quality_score"] for a in filtered if a.get("avg_quality_score")]
+            result["current"]["kpi"] = {
+                "active_agents": len(filtered),
+                "total_intake": sum(a.get("intake") or 0 for a in filtered),
+                "avg_response_sec": (sum(resp_vals) / len(resp_vals)) if resp_vals else None,
+                "avg_quality_score": (sum(qual_vals) / len(qual_vals)) if qual_vals else None,
+                "total_escalation": sum(a.get("escalation_count") or 0 for a in filtered),
+            }
+        else:
+            result["current"]["kpi"] = {
+                "active_agents": 0,
+                "total_intake": 0,
+                "avg_response_sec": None,
+                "avg_quality_score": None,
+                "total_escalation": 0,
+            }
+
+        # 过滤 anomalies(只留该群的人)
+        canonical_in_group = {a.get("canonical_name") for a in filtered}
+        result["current"]["anomalies"] = [
+            a for a in result["current"]["anomalies"]
+            if a.get("agent") in canonical_in_group
+        ]
+
+        # 过滤 matrix(agents + cells),并据 cells 重算 trend
+        matrix = result["current"].get("matrix", {})
+        if matrix:
+            matrix["agents"] = [a for a in matrix.get("agents", []) if a in canonical_in_group]
+            matrix["cells"] = [c for c in matrix.get("cells", []) if c.get("agent") in canonical_in_group]
+            result["current"]["matrix"] = matrix
+
+            trend_map = defaultdict(lambda: {"intake": 0, "agents": set()})
+            for cell in matrix["cells"]:
+                d = cell.get("date")
+                trend_map[d]["intake"] += cell.get("intake") or 0
+                trend_map[d]["agents"].add(cell.get("agent"))
+            result["current"]["trend"] = [
+                {"date": d, "intake": v["intake"], "agents": len(v["agents"])}
+                for d, v in sorted(trend_map.items())
+            ]
+
+        result["group_filter"] = group_filter
+        result["group_description"] = GROUP_KEYS[group_filter]["description"]
+
+    return jsonify(result)
 
 
 @app.route("/api/agents/alias-suggestions")
