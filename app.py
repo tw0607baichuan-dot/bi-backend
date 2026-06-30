@@ -1054,6 +1054,7 @@ SYS02_SHEET_ID = "1lKjyN-jDX4IliiNvOehXmyV9dOLIFn1J0syvCLdjWzk"
 SHEET_WHITELIST = {
     "reply": "1lKjyN-jDX4IliiNvOehXmyV9dOLIFn1J0syvCLdjWzk",
     "ops":   "19KeuX9iq7U-ox4IFOIUEVhNMm-kgSJhBNWtsC9h9g40",
+    "attendance": "14QWhZnl7DvnUpaKk_JcqjNamahaYOqRVyoqCRV89Ebc",  # Phase 15 出勤排班
 }
 
 # Sheet HTML 内每个 tab 的结构(已勘查验证):
@@ -1078,23 +1079,42 @@ def _sys02_parse_ym(name):
     return None
 
 
-def _resolve_current_gid(sheet_id, prev=False):
-    """共用:拉 sheet HTML 解析 tab 清单,找出目标月 tab 的 gid。
-       Args: sheet_id (str) - Google Sheet ID
-             prev (bool)    - True 时找「当月-1 月」的 tab(月环比用),
-                              含跨年回退(1月 prev → 去年 12月)。
-       Returns: Flask JSON { ok, gid, tab_name, month, year, sheet_id };
-                找不到目标月则 ok=False + fallback_gid (最新 tab) (HTTP 200);
-                拉取/解析失败回 500。"""
-    import requests
+# Phase 15 出勤排班:tab 命名「N月假表YY」(月在前 / YY 在后;容忍「假表」与 YY 间空白,
+# 实测有 '6月假表26' 与 '12月假表 25' 两种写法)。无年份后缀者(如 '6月假表')回 None 避免跨年误判。
+_ATTENDANCE_TAB_RE = re.compile(r'(\d{1,2})月假表\s*(\d{2})')
 
-    now = datetime.datetime.now()
-    year, month = now.year, now.month
-    if prev:
-        target_year = year if month > 1 else year - 1
-        target_month = (month - 1) or 12
+
+def _attendance_parse_ym(name):
+    """解析「N月假表YY」格式 tab 名。例:'6月假表26'→(2026,6) / '12月假表 25'→(2025,12)。"""
+    m = _ATTENDANCE_TAB_RE.search(name or "")
+    if not m:
+        return None
+    month = int(m.group(1))
+    if month < 1 or month > 12:
+        return None
+    return (2000 + int(m.group(2)), month)
+
+
+def _resolve_gid_core(sheet_id, prev=False, target_ym=None, parse_fn=None):
+    """共用核心:拉 sheet HTML 解析 tab 清单,找出目标月 tab 的 gid。回 (dict, http_status)。
+       Args: sheet_id (str)        - Google Sheet ID
+             prev (bool)           - True 时找「当月-1 月」的 tab(月环比用),含跨年回退。
+             target_ym (tuple|None)- (year, month) 指定任意月;None 维持 now()/prev 行为(零回归)。
+             parse_fn (callable)   - tab 名→(年,月) 解析函数;None 用 _sys02_parse_ym(预设)。
+       Returns: ({ ok, gid, tab_name, month, year, sheet_id }, 200);
+                找不到目标月则 (ok=False + fallback_gid, 200);拉取/解析失败回 (.., 500)。"""
+    import requests
+    if parse_fn is None:
+        parse_fn = _sys02_parse_ym
+
+    if target_ym is None:
+        now = datetime.datetime.now()
+        target_year, target_month = now.year, now.month
+        if prev:
+            target_year = target_year if target_month > 1 else target_year - 1
+            target_month = (target_month - 1) or 12
     else:
-        target_year, target_month = year, month
+        target_year, target_month = target_ym
 
     try:
         r = requests.get(
@@ -1102,10 +1122,10 @@ def _resolve_current_gid(sheet_id, prev=False):
             timeout=15,
         )
     except Exception as e:
-        return jsonify({"ok": False, "message": f"Sheet 拉取异常: {e}"}), 500
+        return {"ok": False, "message": f"Sheet 拉取异常: {e}"}, 500
 
     if r.status_code != 200:
-        return jsonify({"ok": False, "message": f"Sheet 拉取失败: HTTP {r.status_code}"}), 500
+        return {"ok": False, "message": f"Sheet 拉取失败: HTTP {r.status_code}"}, 500
 
     # 抽所有 (gid, tab名) 配对并解析年月;按 gid 去重
     tabs = []  # [(year, month, gid, name)]
@@ -1113,35 +1133,41 @@ def _resolve_current_gid(sheet_id, prev=False):
     for gid, name in _SYS02_TAB_RE.findall(r.text):
         if gid in seen:
             continue
-        ym = _sys02_parse_ym(name)
+        ym = parse_fn(name)
         if not ym:
             continue
         seen.add(gid)
         tabs.append((ym[0], ym[1], gid, name))
 
     if not tabs:
-        return jsonify({"ok": False, "message": "Sheet 内未解析到任何 tab,HTML 结构可能已变"}), 500
+        return {"ok": False, "message": "Sheet 内未解析到任何 tab,HTML 结构可能已变"}, 500
 
     target = next((t for t in tabs if t[0] == target_year and t[1] == target_month), None)
     if target:
         y, mo, gid, name = target
-        return jsonify({
+        return {
             "ok": True,
             "gid": gid,
             "tab_name": name,
             "month": mo,
             "year": y,
             "sheet_id": sheet_id,
-        })
+        }, 200
 
     latest = sorted(tabs, key=lambda t: (t[0], t[1]), reverse=True)[0]
-    return jsonify({
+    return {
         "ok": False,
         "message": f"目标月 ({target_year}/{target_month:02d}) tab 未建立,最新为 {latest[3]}",
         "fallback_gid": latest[2],
         "fallback_tab_name": latest[3],
         "sheet_id": sheet_id,
-    })
+    }, 200
+
+
+def _resolve_current_gid(sheet_id, prev=False, target_ym=None, parse_fn=None):
+    """对外 Flask 版:回 jsonify Response(沿用旧 caller SYS-02/03 用法,零回归)。"""
+    data, code = _resolve_gid_core(sheet_id, prev=prev, target_ym=target_ym, parse_fn=parse_fn)
+    return jsonify(data), code
 
 
 @app.route("/api/current-month-gid", methods=["GET"])
@@ -1164,6 +1190,227 @@ def current_month_gid():
 def sys02_current_month_gid():
     """旧 endpoint 保留(前端 SYS-02/03 沿用),内部转 reply 表。"""
     return _resolve_current_gid(SHEET_WHITELIST["reply"])
+
+
+# ════════════════════ Phase 15 出勤排班 ════════════════════
+
+# 状态分类常量(实测 6月假表26):
+#   正常类:班 / 休 / 特休 / 例假(不算异常)
+#   主异常:迟到 / 早退 / 缺勤 / 事假(计入绩效);裸「迟」= 主管简写迟到、缺分钟数 → 单独标记
+#   副异常:病假 / 生理假 / 家庭照顾假(参考)
+ATTENDANCE_NORMAL = {'班', '休', '特休', '例假'}
+ATTENDANCE_MAIN_ANOMALY_KEYWORDS = ['迟到', '早退', '缺勤', '事假']   # 计入绩效
+ATTENDANCE_MINOR_ANOMALY_KEYWORDS = ['病假', '生理假', '家庭照顾假']  # 参考
+
+# 21 名客服按班别配置(权威 key;Sheet 内栏位顺序固定,positional 对应)
+ATTENDANCE_AGENTS = {
+    '早班': ['贝果', '卡比', '艾娃', '路奇', '果冻', '艾瑞克', '宋江'],
+    '中班': ['百川', '沙西米', '卡姆利', '小玥', '鱼丸', '翅膀', '霄霄'],
+    '夜班': ['轩轩', '大雄', '咖啡', '小江', '九节狼', '小邱', '当肯'],
+}
+
+
+def _classify_attendance_status(status):
+    """分类状态 → (category, type, detail)。
+       '班'→('normal','班',None) / '迟到7M'→('main_anomaly','迟到','7M')
+       裸'迟'→('main_anomaly','迟(未填分钟)',None) / '病假'→('minor_anomaly','病假',None)
+       ''→('blank',None,None) / 其他→('unknown', 原文, None)。"""
+    if not status or status.strip() == '':
+        return ('blank', None, None)
+    s = status.strip()
+    if s in ATTENDANCE_NORMAL:
+        return ('normal', s, None)
+    # 主异常关键字匹配(带分钟/时长 detail)
+    for kw in ATTENDANCE_MAIN_ANOMALY_KEYWORDS:
+        if s.startswith(kw):
+            detail = s[len(kw):].strip() or None
+            return ('main_anomaly', kw, detail)
+    # 裸「迟」特例(主管简写,未填分钟数;计入主异常但单独标记,方便回 Sheet 补)
+    if s == '迟':
+        return ('main_anomaly', '迟(未填分钟)', None)
+    # 副异常关键字匹配
+    for kw in ATTENDANCE_MINOR_ANOMALY_KEYWORDS:
+        if s.startswith(kw):
+            detail = s[len(kw):].strip() or None
+            return ('minor_anomaly', kw, detail)
+    # 未识别(可能新格式 → 回报让主管确认)
+    return ('unknown', s, None)
+
+
+def _fetch_attendance_csv_text(sheet_id, gid):
+    """抓公开 CSV 原文(positional 解析用)。
+       注:不可用 agents_sync.fetch_csv —— 它回 csv.DictReader,会把第 0 行『备注』
+       误当表头,且三班并排栏位会被压平;出勤表必须按栏位 index 解析。"""
+    import requests
+    url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
+    resp = requests.get(url, timeout=20)
+    resp.raise_for_status()
+    resp.encoding = "utf-8"
+    text = resp.text
+    head = text.lstrip()[:64].lower()
+    if head.startswith("<!doctype") or head.startswith("<html"):
+        raise RuntimeError("拉到 HTML 而非 CSV(Sheet 可能未公开为『知道连结的人可检视』)")
+    return text
+
+
+def _parse_attendance_csv(csv_text, year, month):
+    """parse Sheet CSV(positional)→ 月度汇总 summary + 异常时间线 timeline + kpi + unknowns。
+       栏位布局(实测 6月假表26,0-indexed):
+         早班 日期 col 0,客服 col 2-8;中班 日期 col 10,客服 col 12-18;夜班 日期 col 20,客服 col 22-28。
+       Row 0=备注、Row 1=表头、Row 2+=每天资料(故从 index 2 起读)。"""
+    import csv
+    import calendar
+
+    rows = list(csv.reader(io.StringIO(csv_text)))
+    if len(rows) < 3:
+        return None
+
+    shift_layouts = [
+        ('早班', 0, 2, ATTENDANCE_AGENTS['早班']),   # (班别, 日期col, 客服起始col, 客服名单)
+        ('中班', 10, 12, ATTENDANCE_AGENTS['中班']),
+        ('夜班', 20, 22, ATTENDANCE_AGENTS['夜班']),
+    ]
+
+    agent_stats = {}   # {(shift, name): {...}}
+    timeline = []
+    unknowns = []      # 未识别状态(回报让主管确认)
+
+    last_day = calendar.monthrange(year, month)[1]
+
+    for row_idx in range(2, min(2 + last_day, len(rows))):
+        row = rows[row_idx]
+        if not row or len(row) < 1:
+            continue
+
+        for shift_name, date_col, agent_start_col, agent_names in shift_layouts:
+            if len(row) <= date_col:
+                continue
+            date_str = (row[date_col] or '').strip()
+            if not date_str or '/' not in date_str:
+                continue
+            try:
+                _m, day_part = date_str.split('/')
+                day = int(day_part)
+                date_iso = f"{year:04d}-{month:02d}-{day:02d}"
+            except (ValueError, IndexError):
+                continue
+
+            for i, agent_name in enumerate(agent_names):
+                col_idx = agent_start_col + i
+                if len(row) <= col_idx:
+                    continue
+                status = (row[col_idx] or '').strip()
+                category, atype, detail = _classify_attendance_status(status)
+
+                key = (shift_name, agent_name)
+                if key not in agent_stats:
+                    agent_stats[key] = {
+                        'shift': shift_name, 'agent_name': agent_name,
+                        'shift_days': 0, 'rest_days': 0,
+                        'main_count': 0, 'minor_count': 0, 'anomalies': [],
+                    }
+                stat = agent_stats[key]
+
+                if status == '班':
+                    stat['shift_days'] += 1
+                elif status in ('休', '特休', '例假'):
+                    stat['rest_days'] += 1
+                elif category in ('main_anomaly', 'minor_anomaly'):
+                    cat_short = 'main' if category == 'main_anomaly' else 'minor'
+                    if cat_short == 'main':
+                        stat['main_count'] += 1
+                    else:
+                        stat['minor_count'] += 1
+                    event = {'date': date_iso, 'type': atype, 'detail': detail, 'category': cat_short}
+                    stat['anomalies'].append(event)
+                    timeline.append({
+                        'date': date_iso, 'agent_name': agent_name, 'shift': shift_name,
+                        'type': atype, 'detail': detail, 'category': cat_short,
+                    })
+                elif category == 'unknown':
+                    unknowns.append({
+                        'date': date_iso, 'agent_name': agent_name,
+                        'shift': shift_name, 'raw': status,
+                    })
+
+    # 组织成各班别 + 排序(主异常多在前)
+    summary = {'早班': [], '中班': [], '夜班': []}
+    for (shift, agent_name), stat in agent_stats.items():
+        summary[shift].append({
+            'agent_name': agent_name, 'shift': shift,
+            'shift_days': stat['shift_days'], 'rest_days': stat['rest_days'],
+            'main_count': stat['main_count'], 'minor_count': stat['minor_count'],
+            'anomalies': stat['anomalies'],
+        })
+    for shift in summary:
+        summary[shift].sort(key=lambda x: (-x['main_count'], -x['minor_count']))
+
+    timeline.sort(key=lambda x: x['date'], reverse=True)  # 最新在前
+
+    all_agents = [a for shift_agents in summary.values() for a in shift_agents]
+    main_total = sum(a['main_count'] for a in all_agents)
+    minor_total = sum(a['minor_count'] for a in all_agents)
+    affected = sum(1 for a in all_agents if a['main_count'] > 0 or a['minor_count'] > 0)
+
+    return {
+        'summary': summary,
+        'timeline': timeline,
+        'unknowns': unknowns,
+        'kpi': {
+            'main_anomaly_total': main_total,
+            'minor_anomaly_total': minor_total,
+            'affected_agents': affected,
+            'total_agents': len(all_agents),
+        },
+    }
+
+
+@app.route("/api/attendance/data", methods=["GET"])
+def attendance_data():
+    """Phase 15 出勤排班月度资料。?month=YYYY-MM(省略=当月)。"""
+    month = request.args.get("month")
+    if month:
+        try:
+            y_str, m_str = month.split('-')
+            target_ym = (int(y_str), int(m_str))
+            if target_ym[1] < 1 or target_ym[1] > 12:
+                raise ValueError
+        except (ValueError, IndexError):
+            return jsonify({"status": "error", "message": "month 格式 YYYY-MM"}), 400
+    else:
+        now = datetime.datetime.now()
+        target_ym = (now.year, now.month)
+
+    sheet_id = SHEET_WHITELIST.get('attendance')
+    if not sheet_id:
+        return jsonify({"status": "error", "message": "attendance sheet not configured"}), 500
+
+    gid_result, _code = _resolve_gid_core(
+        sheet_id, target_ym=target_ym, parse_fn=_attendance_parse_ym,
+    )
+    if not gid_result.get('ok'):
+        return jsonify({
+            "status": "error",
+            "message": f"无法找到 {target_ym[0]}-{target_ym[1]:02d} 的排班 tab",
+            "resolver_result": gid_result,
+        }), 404
+
+    try:
+        csv_text = _fetch_attendance_csv_text(sheet_id, gid_result['gid'])
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"fetch CSV failed: {e}"}), 500
+
+    parsed = _parse_attendance_csv(csv_text, target_ym[0], target_ym[1])
+    if parsed is None:
+        return jsonify({"status": "error", "message": "parse failed"}), 500
+
+    return jsonify({
+        "status": "ok",
+        "month": f"{target_ym[0]:04d}-{target_ym[1]:02d}",
+        "tab_name": gid_result.get('tab_name'),
+        "gid": gid_result.get('gid'),
+        **parsed,
+    })
 
 
 if __name__ == "__main__":
